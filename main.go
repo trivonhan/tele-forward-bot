@@ -36,8 +36,38 @@ func loadConfig(filename string) (*Config, error) {
 
 	// Clean up usernames (remove @ if present)
 	for i := range config.Sources {
-		if config.Sources[i].Type == "group" && config.Sources[i].Username != "" {
+		if (config.Sources[i].Type == "group" || config.Sources[i].Type == "public_group") && config.Sources[i].Username != "" {
 			config.Sources[i].Username = strings.TrimPrefix(config.Sources[i].Username, "@")
+		}
+	}
+
+	// Validation
+	for i, source := range config.Sources {
+		switch source.Type {
+		case "channel":
+			if source.ID == 0 {
+				return nil, fmt.Errorf("channel source at index %d missing required ID", i)
+			}
+		case "group":
+			if source.ID == 0 {
+				return nil, fmt.Errorf("group source at index %d missing required ID", i)
+			}
+			if len(source.UserIDs) == 0 {
+				return nil, fmt.Errorf("group source at index %d missing required user_ids", i)
+			}
+		case "public_group":
+			if source.Username == "" {
+				return nil, fmt.Errorf("public_group source at index %d missing required username", i)
+			}
+			if len(source.UserIDs) == 0 {
+				return nil, fmt.Errorf("public_group source at index %d missing required user_ids", i)
+			}
+		case "user":
+			if len(source.UserIDs) == 0 {
+				return nil, fmt.Errorf("user source at index %d missing required user_ids", i)
+			}
+		default:
+			return nil, fmt.Errorf("unknown source type at index %d: %s", i, source.Type)
 		}
 	}
 
@@ -73,6 +103,9 @@ func main() {
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 	log.Printf("Monitoring for user IDs: %v", getAllUserIDs(config))
+
+	// Start a goroutine to monitor public groups
+	go monitorPublicGroups(bot, config)
 
 	// Create update configuration with a longer timeout
 	u := tgbotapi.NewUpdate(0)
@@ -146,47 +179,65 @@ func handleMessage(bot *tgbotapi.BotAPI, message *tgbotapi.Message, config *Conf
 		return
 	}
 
-	// Check if the user is in any of our monitored user lists
-	isMonitoredUser := false
-	for _, source := range config.Sources {
-		for _, userID := range source.UserIDs {
-			if message.From.ID == userID {
-				isMonitoredUser = true
-				break
-			}
-		}
-		if isMonitoredUser {
-			break
-		}
-	}
-
-	if !isMonitoredUser {
-		log.Printf("Message from unmonitored user: %d", message.From.ID)
-		return
-	}
-
-	// If it's a direct message to the bot, forward it
+	// If it's a direct message to the bot, check if from monitored user
 	if message.Chat.Type == "private" {
-		log.Printf("Received direct message from monitored user %d", message.From.ID)
-		forwardMessage(bot, config.TargetChannelID, message.Chat.ID, message.MessageID)
+		// Check if user is in monitored list
+		for _, source := range config.Sources {
+			if source.Type == "user" {
+				for _, userID := range source.UserIDs {
+					if message.From.ID == userID {
+						log.Printf("Received direct message from monitored user %d", message.From.ID)
+						forwardMessage(bot, config.TargetChannelID, message.Chat.ID, message.MessageID)
+						return
+					}
+				}
+			}
+		}
 		return
 	}
 
-	// Check if message is from monitored groups
-	for _, source := range config.Sources {
-		if source.Type == "group" {
-			// Clean up username for comparison
-			messageUsername := strings.TrimPrefix(message.Chat.UserName, "@")
-			configUsername := strings.TrimPrefix(source.Username, "@")
+	// Handle messages from groups
+	if message.Chat.Type == "group" || message.Chat.Type == "supergroup" {
+		// Check if the group is in our monitored list and if user is monitored in that group
+		for _, source := range config.Sources {
+			if source.Type == "group" || source.Type == "public_group" {
+				// Check if this is the right group first
+				isMatchingGroup := false
 
-			log.Printf("Comparing group usernames - Message: %s, Config: %s", messageUsername, configUsername)
+				// For groups with ID
+				if source.ID != 0 && message.Chat.ID == source.ID {
+					isMatchingGroup = true
+				} else {
+					// For groups with username
+					messageUsername := strings.TrimPrefix(message.Chat.UserName, "@")
+					configUsername := strings.TrimPrefix(source.Username, "@")
 
-			if strings.EqualFold(messageUsername, configUsername) {
-				log.Printf("Found matching group: %s", messageUsername)
-				forwardMessage(bot, config.TargetChannelID, message.Chat.ID, message.MessageID)
-				break
+					if configUsername != "" && strings.EqualFold(messageUsername, configUsername) {
+						isMatchingGroup = true
+					}
+				}
+
+				// If this is our monitored group, check if the user is monitored
+				if isMatchingGroup {
+					log.Printf("Found matching group, checking if user %d is monitored", message.From.ID)
+
+					for _, userID := range source.UserIDs {
+						if message.From.ID == userID {
+							log.Printf("Forwarding message from monitored user %d in group", message.From.ID)
+							forwardMessage(bot, config.TargetChannelID, message.Chat.ID, message.MessageID)
+							return
+						}
+					}
+
+					// If we get here, the user is not monitored in this group
+					log.Printf("User %d is not monitored in this group", message.From.ID)
+					return
+				}
 			}
 		}
+
+		// If we get here, the group is not monitored
+		log.Printf("Group %d is not monitored", message.Chat.ID)
 	}
 }
 
@@ -222,4 +273,29 @@ func forwardMessage(bot *tgbotapi.BotAPI, targetID, fromChatID int64, messageID 
 	} else {
 		log.Printf("Successfully forwarded message from chat %d", fromChatID)
 	}
-} 
+}
+
+func monitorPublicGroups(bot *tgbotapi.BotAPI, config *Config) {
+	log.Println("Starting monitoring of public groups...")
+
+	publicGroups := make([]string, 0)
+	for _, source := range config.Sources {
+		if source.Type == "public_group" && source.Username != "" {
+			publicGroups = append(publicGroups, source.Username)
+		}
+	}
+
+	if len(publicGroups) == 0 {
+		log.Println("No public groups configured for monitoring")
+		return
+	}
+
+	log.Printf("Monitoring the following public groups: %v", publicGroups)
+
+	// Since we can't directly monitor public groups without joining them,
+	// Let the user know they need to set up a webhook or join the groups
+	log.Println("NOTE: To monitor public groups without joining them, you need to:")
+	log.Println("1. Join the target groups with your bot")
+	log.Println("2. Or use a webhook approach by setting up a public endpoint")
+	log.Println("Telegram API doesn't allow getting messages from groups the bot hasn't joined")
+}
