@@ -8,6 +8,11 @@ import os
 import json
 import logging
 import asyncio
+import signal
+import sys
+import time
+import fcntl
+import yaml  # Add YAML import
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, User, Chat, ChatEmpty, PeerChannel, PeerChat, PeerUser
 from telethon.errors import ChatAdminRequiredError, ChannelPrivateError, UsernameNotOccupiedError
@@ -26,8 +31,17 @@ logger = logging.getLogger(__name__)
 # Load configuration
 def load_config():
     try:
-        with open('config.json', 'r') as f:
-            return json.load(f)
+        # Try to load YAML config first
+        if os.path.exists('config.yaml'):
+            with open('config.yaml', 'r') as f:
+                return yaml.safe_load(f)
+        # Fall back to JSON if YAML doesn't exist
+        elif os.path.exists('config.json'):
+            with open('config.json', 'r') as f:
+                return json.load(f)
+        else:
+            logger.error("No configuration file found. Please create either config.yaml or config.json")
+            return None
     except Exception as e:
         logger.error(f"Error loading config: {e}")
         return None
@@ -337,6 +351,15 @@ async def forward_message(event):
         logger.info(f"Attempting to send message from {chat.title} by {sender_name}")
         logger.info(f"Message content: {message_text[:100]}{'...' if len(message_text) > 100 else ''}")
         
+        # Check if this is a reply to another message
+        replied_message = None
+        if event.message.reply_to:
+            try:
+                replied_message = await event.message.get_reply_message()
+                logger.info(f"Message is a reply to: {replied_message.text[:100] if replied_message.text else 'media message'}")
+            except Exception as e:
+                logger.error(f"Error getting replied message: {e}")
+        
         # Download media if present
         media_path = None
         if event.message.media:
@@ -356,6 +379,22 @@ async def forward_message(event):
         
         # Add sender info
         source_info += f"Author: {sender_name}\n"
+        
+        # If this is a reply, add the replied message info
+        if replied_message:
+            replied_sender = await replied_message.get_sender()
+            replied_sender_name = None
+            if hasattr(replied_sender, 'username') and replied_sender.username:
+                replied_sender_name = f"@{replied_sender.username}"
+            elif hasattr(replied_sender, 'first_name'):
+                replied_sender_name = replied_sender.first_name
+            elif hasattr(replied_sender, 'title'):
+                replied_sender_name = replied_sender.title
+            else:
+                replied_sender_name = "Unknown"
+            
+            replied_text = replied_message.text if replied_message.text else "media message"
+            source_info += f"Replying to {replied_sender_name}: {replied_text[:100]}{'...' if len(replied_text) > 100 else ''}\n"
         
         # If there's text, add it to the message
         if message_text:
