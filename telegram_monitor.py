@@ -112,6 +112,53 @@ async def resolve_entities(config):
 # Register event handlers for each source type
 async def register_event_handlers():
     """Register event handlers for each source type"""
+    # Get all channel IDs from config
+    channel_ids = []
+    for source in config['sources']:
+        if source['type'] == 'channel' and 'id' in source:
+            # Ensure channel ID is in the correct format
+            channel_id = source['id']
+            # If the ID doesn't start with -100, add it
+            if not str(channel_id).startswith('-100'):
+                channel_id = int(f"-100{abs(channel_id)}")
+                source['id'] = channel_id  # Update the config with the correct ID
+            channel_ids.append(channel_id)
+            logger.info(f"Added channel ID: {channel_id}")
+    
+    # Register a specific handler for channels if we have any
+    if channel_ids:
+        logger.info(f"Registering event handler for channels: {channel_ids}")
+        
+        @client.on(events.NewMessage(chats=channel_ids))
+        async def channel_handler(event):
+            """Handle messages from channels"""
+            try:
+                # Get the chat where the message was sent
+                chat = await event.get_chat()
+                logger.info(f"Received message from channel: {chat.id} - {chat.title}")
+                
+                # Find the matching source config
+                source_config = None
+                for source in config['sources']:
+                    if source['type'] == 'channel':
+                        # Normalize both IDs to the same format for comparison
+                        config_id = str(source['id']).replace('-100', '')
+                        event_id = str(chat.id).replace('-100', '')
+                        if config_id == event_id:
+                            source_config = source
+                            break
+                
+                if not source_config:
+                    logger.warning(f"No matching source config found for channel {chat.id}")
+                    return
+                
+                # Forward all channel messages
+                logger.info(f"Forwarding message from channel {chat.title}")
+                await forward_message(event)
+            
+            except Exception as e:
+                logger.error(f"Error processing channel message: {e}")
+    
     # Get all private group IDs from config
     private_group_ids = []
     for source in config['sources']:
@@ -152,7 +199,7 @@ async def register_event_handlers():
                 if 'sender_info' in source_config:
                     sender_info = source_config['sender_info']
                     
-                    # Check username list
+                    # Check username list if configured
                     if 'username' in sender_info:
                         usernames = sender_info['username']
                         if isinstance(usernames, str):
@@ -161,8 +208,8 @@ async def register_event_handlers():
                         if hasattr(sender, 'username') and sender.username in usernames:
                             should_forward = True
                     
-                    # Check user_id list
-                    elif 'user_id' in sender_info:
+                    # Check user_id list if configured
+                    if 'user_id' in sender_info:
                         user_ids = sender_info['user_id']
                         if not isinstance(user_ids, list):
                             user_ids = [user_ids]
@@ -201,13 +248,15 @@ async def register_event_handlers():
                 logger.debug(f"Skipping private group message in general handler: {chat.id}")
                 return
             
-            # Check if this is a channel or public group we're monitoring
+            # Skip if this is a channel (handled by the specific handler)
+            if any(source['type'] == 'channel' and chat.id == source['id'] for source in config['sources']):
+                logger.debug(f"Skipping channel message in general handler: {chat.id}")
+                return
+            
+            # Check if this is a public group we're monitoring
             source_config = None
             for source in config['sources']:
-                if source['type'] == 'channel' and chat.id == source['id']:
-                    source_config = source
-                    break
-                elif source['type'] == 'public_group' and hasattr(chat, 'username') and chat.username == source['username']:
+                if source['type'] == 'public_group' and hasattr(chat, 'username') and chat.username == source['username']:
                     source_config = source
                     break
             
@@ -241,7 +290,7 @@ async def register_event_handlers():
                             should_forward = True
                     
                     # Check user_id list
-                    elif 'user_id' in sender_info:
+                    if 'user_id' in sender_info:
                         user_ids = sender_info['user_id']
                         if not isinstance(user_ids, list):
                             user_ids = [user_ids]
@@ -274,7 +323,18 @@ async def forward_message(event):
         sender = await event.get_sender()
         message_text = event.message.text if event.message.text else ""
         
-        logger.info(f"Attempting to send message from {chat.title} by {sender.first_name}")
+        # Get sender name safely
+        sender_name = None
+        if hasattr(sender, 'username') and sender.username:
+            sender_name = f"@{sender.username}"
+        elif hasattr(sender, 'first_name'):
+            sender_name = sender.first_name
+        elif hasattr(sender, 'title'):  # For channels
+            sender_name = sender.title
+        else:
+            sender_name = "Unknown"
+        
+        logger.info(f"Attempting to send message from {chat.title} by {sender_name}")
         logger.info(f"Message content: {message_text[:100]}{'...' if len(message_text) > 100 else ''}")
         
         # Download media if present
@@ -294,64 +354,12 @@ async def forward_message(event):
         # Prepare source information for all messages
         source_info = f"From: {chat.title}\n"
         
-        # Get sender information based on configuration
-        sender_info = None
-        for source in config['sources']:
-            if (source['type'] == 'channel' and chat.id == source['id']) or \
-               (source['type'] == 'public_group' and hasattr(chat, 'username') and chat.username == source['username']) or \
-               (source['type'] == 'private_group' and chat.id == source['id']):
-                if 'sender_info' in source:
-                    sender_info = source['sender_info']
-                break
-        
-        # If sender_info is configured, use it
-        if sender_info:
-            # Handle username as a string or array
-            if 'username' in sender_info:
-                usernames = sender_info['username']
-                # Convert single username to array for consistent handling
-                if isinstance(usernames, str):
-                    usernames = [usernames]
-                
-                # Join all usernames with commas
-                if usernames:
-                    username_list = ", ".join([f"@{username}" for username in usernames])
-                    source_info += f"Author: {username_list}\n"
-            
-            # Handle user_id as a string, number, or array
-            elif 'user_id' in sender_info:
-                user_ids = sender_info['user_id']
-                # Convert single user_id to array for consistent handling
-                if not isinstance(user_ids, list):
-                    user_ids = [user_ids]
-                
-                # Try to get user info from IDs
-                user_names = []
-                for user_id in user_ids:
-                    try:
-                        user = await client.get_entity(user_id)
-                        if hasattr(user, 'username') and user.username:
-                            user_names.append(f"@{user.username}")
-                        elif hasattr(user, 'first_name'):
-                            user_names.append(user.first_name)
-                    except Exception as e:
-                        logger.error(f"Error getting user info from ID {user_id}: {e}")
-                        user_names.append(f"User ID {user_id}")
-                
-                # Join all user names with commas
-                if user_names:
-                    user_name_list = ", ".join(user_names)
-                    source_info += f"Author: {user_name_list}\n"
-        else:
-            # Fall back to actual sender info
-            if hasattr(sender, 'username') and sender.username:
-                source_info += f"Author: @{sender.username}\n"
-            elif hasattr(sender, 'first_name'):
-                source_info += f"Author: {sender.first_name}\n"
+        # Add sender info
+        source_info += f"Author: {sender_name}\n"
         
         # If there's text, add it to the message
         if message_text:
-            source_info += f"Original message: {message_text}"
+            source_info += f"Message: {message_text}"
         
         # Send the message with media if available
         try:
