@@ -1,0 +1,40 @@
+# Target supergroup where messages will be forwarded to
+# This must be a supergroup to support topics
+target_channel_id: -1001234567890
+
+# Optional: Global topic ID (will be used if no source-specific topic is provided)
+# topic_id: 1
+
+# List of sources to monitor
+sources:
+  # Channel sources (messages from these channels will be forwarded without filtering)
+  - type: channel
+    id: -1001111111111  # Channel ID
+    target_topic: 2  # Optional: Topic ID where messages from this source will be forwarded
+
+  - type: channel
+    id: -1001222222222  # Channel ID
+    target_topic: 3  # Messages from this channel will go to topic 3
+
+  # Private group sources (messages will be filtered based on sender)
+  - type: private_group
+    id: -1001333333333  # Private group ID
+    target_topic: 4  # Messages will go to topic 4
+    # Optional: Filter by specific users
+    sender_info:
+      username: ["username1"]  # Only messages from this username will be forwarded
+      user_id: [123456789, 987654321]  # Or from these user IDs
+
+  # Public group sources (messages will be filtered based on sender)
+  - type: public_group
+    username: "public_group_name"  # Public group username (without @)
+    target_topic: 5  # Messages will go to topic 5
+    # Optional: Filter by specific users
+    sender_info:
+      user_id: [123456789]  # Only messages from these user IDs
+      username: ["username2", "username3"]  # Or from these usernames
+      
+  # Example without a target_topic (will use the global topic_id if set)
+  - type: public_group
+    username: "another_group_name"
+    # No target_topic specified, will use global topic_id if set or main chat if not 

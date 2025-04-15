@@ -13,6 +13,8 @@ import sys
 import time
 import fcntl
 import yaml  # Add YAML import
+import shutil
+from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.tl.types import Channel, User, Chat, ChatEmpty, PeerChannel, PeerChat, PeerUser
 from telethon.errors import ChatAdminRequiredError, ChannelPrivateError, UsernameNotOccupiedError
@@ -34,14 +36,31 @@ def load_config():
         # Try to load YAML config first
         if os.path.exists('config.yaml'):
             with open('config.yaml', 'r') as f:
-                return yaml.safe_load(f)
+                config = yaml.safe_load(f)
         # Fall back to JSON if YAML doesn't exist
         elif os.path.exists('config.json'):
             with open('config.json', 'r') as f:
-                return json.load(f)
+                config = json.load(f)
         else:
             logger.error("No configuration file found. Please create either config.yaml or config.json")
             return None
+        
+        # Check for required config values
+        if 'target_channel_id' not in config:
+            logger.error("target_channel_id is required in the configuration")
+            return None
+        
+        # Check if global topic_id is provided
+        if 'topic_id' in config:
+            logger.info(f"Global topic ID configured: {config['topic_id']}")
+        
+        # Check for per-source target_topic
+        if 'sources' in config:
+            for i, source in enumerate(config['sources']):
+                if 'target_topic' in source:
+                    logger.info(f"Source-specific topic ID configured for {source.get('id', source.get('username', f'source {i}'))}: {source['target_topic']}")
+        
+        return config
     except Exception as e:
         logger.error(f"Error loading config: {e}")
         return None
@@ -68,6 +87,27 @@ async def resolve_entities(config):
         target_channel = await client.get_entity(config['target_channel_id'])
         known_entities[config['target_channel_id']] = target_channel
         logger.info(f"Successfully resolved target channel: {target_channel.title}")
+        
+        # Inform if using global topic in a supergroup
+        if 'topic_id' in config:
+            logger.info(f"Configured to send messages to global topic {config['topic_id']} in group {target_channel.title}")
+            # Check if the target is actually a supergroup (required for topics)
+            if not hasattr(target_channel, 'megagroup') or not target_channel.megagroup:
+                logger.warning(f"Warning: Target {target_channel.title} may not be a supergroup. Topics may not work.")
+        
+        # Check if using per-source topics
+        topic_sources = []
+        if 'sources' in config:
+            for source in config['sources']:
+                if 'target_topic' in source:
+                    source_name = source.get('id', source.get('username', 'unknown source'))
+                    topic_sources.append(f"{source_name} → topic {source['target_topic']}")
+            
+            if topic_sources:
+                logger.info(f"Configured to use per-source topics: {', '.join(topic_sources)}")
+                # Check if the target is actually a supergroup (required for topics)
+                if not hasattr(target_channel, 'megagroup') or not target_channel.megagroup:
+                    logger.warning(f"Warning: Target {target_channel.title} may not be a supergroup. Topics may not work.")
     except Exception as e:
         logger.error(f"Error resolving target channel: {e}")
         # Ask user if they want to use their own user ID as target
@@ -78,6 +118,10 @@ async def resolve_entities(config):
             config['target_channel_id'] = me.id
             known_entities[me.id] = me
             logger.info(f"Using your user ID ({me.id}) as target")
+            # Can't use topics when forwarding to a user
+            if 'topic_id' in config:
+                logger.warning("Topics cannot be used when forwarding to a user. Removing topic_id.")
+                del config['topic_id']
         else:
             target_id = input("Please enter a valid channel ID or username: ")
             try:
@@ -89,6 +133,14 @@ async def resolve_entities(config):
                 config['target_channel_id'] = target.id
                 known_entities[target.id] = target
                 logger.info(f"Successfully resolved new target: {target.title}")
+                
+                # Ask user if they want to use a global topic ID
+                use_topic = input("Do you want to set a global topic ID for all messages? (y/n): ").lower() == 'y'
+                if use_topic:
+                    topic_id = input("Please enter the global topic ID: ")
+                    if topic_id.isdigit():
+                        config['topic_id'] = int(topic_id)
+                        logger.info(f"Using global topic ID {topic_id} for messages")
             except Exception as e:
                 logger.error(f"Error resolving new target: {e}")
                 exit(1)
@@ -374,13 +426,10 @@ async def forward_message(event):
             except Exception as e:
                 logger.error(f"Error downloading media: {e}")
         
-        # Prepare source information for all messages
-        source_info = f"From: {chat.title}\n"
+        # Prepare the formatted message
+        formatted_message = ""
         
-        # Add sender info
-        source_info += f"Author: {sender_name}\n"
-        
-        # If this is a reply, add the replied message info
+        # Add reply information first if present
         if replied_message:
             replied_sender = await replied_message.get_sender()
             replied_sender_name = None
@@ -394,11 +443,43 @@ async def forward_message(event):
                 replied_sender_name = "Unknown"
             
             replied_text = replied_message.text if replied_message.text else "media message"
-            source_info += f"Replying to {replied_sender_name}: {replied_text[:100]}{'...' if len(replied_text) > 100 else ''}\n"
+            formatted_message += f"Replying to {replied_sender_name}: {replied_text[:100]}{'...' if len(replied_text) > 100 else ''}\n"
+            formatted_message += "--------------------------------\n"
         
-        # If there's text, add it to the message
+        # Add the message text if present
         if message_text:
-            source_info += f"Message: {message_text}"
+            formatted_message += f"{message_text}\n"
+        
+        # Add separator line
+        formatted_message += "--------------------------------\n"
+        
+        # Add source information
+        formatted_message += f"From: {chat.title} - {sender_name}"
+        
+        # Find the source config for this message
+        source_config = None
+        topic_id = None
+        
+        for source in config['sources']:
+            if source['type'] == 'channel' and str(chat.id).replace('-100', '') == str(source['id']).replace('-100', ''):
+                source_config = source
+                break
+            elif source['type'] == 'private_group' and chat.id == source['id']:
+                source_config = source
+                break
+            elif source['type'] == 'public_group' and hasattr(chat, 'username') and chat.username == source['username']:
+                source_config = source
+                break
+        
+        # Get topic ID for this source if available
+        if source_config and 'target_topic' in source_config:
+            topic_id = source_config['target_topic']
+            logger.info(f"Using source-specific topic ID: {topic_id}")
+        elif 'topic_id' in config:  # Fall back to global topic ID
+            topic_id = config['topic_id']
+            logger.info(f"Using global topic ID: {topic_id}")
+        else:
+            logger.info("No topic ID found, sending to main chat")
         
         # Send the message with media if available
         try:
@@ -407,30 +488,46 @@ async def forward_message(event):
                 await client.send_file(
                     config['target_channel_id'],
                     media_path,
-                    caption=source_info
+                    caption=formatted_message,
+                    reply_to=topic_id
                 )
                 logger.info("Message sent with media successfully")
             else:
                 # Send just the text if no media
                 await client.send_message(
                     config['target_channel_id'],
-                    source_info
+                    formatted_message,
+                    reply_to=topic_id
                 )
                 logger.info("Message sent as text successfully")
         except Exception as e:
             logger.error(f"Error sending message: {e}")
-            
-            # If sending with media fails, try to send just the text
-            try:
-                await client.send_message(
-                    config['target_channel_id'],
-                    source_info
-                )
-                logger.info("Message sent as text (media sending failed)")
-            except Exception as e2:
-                logger.error(f"Error sending message as text: {e2}")
     except Exception as e:
         logger.error(f"Error in forward_message: {e}")
+
+async def cleanup_downloaded_media():
+    """Clean up the downloaded_media directory"""
+    try:
+        if os.path.exists("downloaded_media"):
+            shutil.rmtree("downloaded_media")
+            os.makedirs("downloaded_media", exist_ok=True)
+            logger.info("Successfully cleaned up downloaded_media directory")
+    except Exception as e:
+        logger.error(f"Error cleaning up downloaded_media directory: {e}")
+
+async def schedule_cleanup():
+    """Schedule daily cleanup at midnight"""
+    while True:
+        now = datetime.now()
+        # Calculate time until next midnight
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        seconds_until_midnight = (next_midnight - now).total_seconds()
+        
+        # Wait until midnight
+        await asyncio.sleep(seconds_until_midnight)
+        
+        # Perform cleanup
+        await cleanup_downloaded_media()
 
 async def main():
     """Main function to run the client"""
@@ -461,6 +558,9 @@ async def main():
             logger.info(f"  - Public group: {source['username']}")
         elif source['type'] == 'private_group':
             logger.info(f"  - Private group: {source['id']}")
+    
+    # Start the cleanup scheduler
+    asyncio.create_task(schedule_cleanup())
     
     # Keep the client running
     await client.run_until_disconnected()
