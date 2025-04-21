@@ -30,6 +30,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Create example config file
+def create_example_config():
+    example_config = """# Target supergroup where messages will be forwarded to
+# This must be a supergroup to support topics
+target_channel_id: -1001234567890
+
+# Optional: Global topic ID (will be used if no source-specific topic is provided)
+# topic_id: 1
+
+# List of sources to monitor
+sources:
+  # Channel sources (messages from these channels will be forwarded without filtering)
+  - type: channel
+    id: -1001111111111  # Channel ID
+    target_topic: 2  # Optional: Topic ID where messages from this source will be forwarded
+
+  - type: channel
+    id: -1001222222222  # Channel ID
+    target_topic: 3  # Messages from this channel will go to topic 3
+
+  # Private group sources (messages will be filtered based on sender)
+  - type: private_group
+    id: -1001333333333  # Private group ID
+    target_topic: 4  # Messages will go to topic 4
+    # Optional: Filter by specific users
+    sender_info:
+      username: ["username1"]  # Only messages from this username will be forwarded
+      user_id: [123456789, 987654321]  # Or from these user IDs
+
+  # Public group sources (messages will be filtered based on sender)
+  - type: public_group
+    username: "public_group_name"  # Public group username (without @)
+    target_topic: 5  # Messages will go to topic 5
+    # Optional: Filter by specific users
+    sender_info:
+      user_id: [123456789]  # Only messages from these user IDs
+      username: ["username2", "username3"]  # Or from these usernames
+      
+  # Example without a target_topic (will use the global topic_id if set)
+  - type: public_group
+    username: "another_group_name"
+    # No target_topic specified, will use global topic_id if set or main chat if not
+"""
+    try:
+        with open('config.yaml.example', 'w') as f:
+            f.write(example_config)
+        logger.info("Created example configuration file: config.yaml.example")
+    except Exception as e:
+        logger.error(f"Error creating example config file: {e}")
+
 # Load configuration
 def load_config():
     try:
@@ -37,17 +87,26 @@ def load_config():
         if os.path.exists('config.yaml'):
             with open('config.yaml', 'r') as f:
                 config = yaml.safe_load(f)
+                logger.info("Loaded configuration from config.yaml")
         # Fall back to JSON if YAML doesn't exist
         elif os.path.exists('config.json'):
             with open('config.json', 'r') as f:
                 config = json.load(f)
+                logger.info("Loaded configuration from config.json")
         else:
             logger.error("No configuration file found. Please create either config.yaml or config.json")
+            
+            # Create example config file if it doesn't exist
+            if not os.path.exists('config.yaml.example'):
+                create_example_config()
+            
+            logger.info("You can use config.yaml.example as a template")
             return None
         
         # Check for required config values
         if 'target_channel_id' not in config:
             logger.error("target_channel_id is required in the configuration")
+            logger.info("Please add target_channel_id to your config file")
             return None
         
         # Check if global topic_id is provided
@@ -58,7 +117,8 @@ def load_config():
         if 'sources' in config:
             for i, source in enumerate(config['sources']):
                 if 'target_topic' in source:
-                    logger.info(f"Source-specific topic ID configured for {source.get('id', source.get('username', f'source {i}'))}: {source['target_topic']}")
+                    source_name = source.get('id', source.get('username', f'source {i+1}'))
+                    logger.info(f"Source-specific topic ID configured for {source_name}: {source['target_topic']}")
         
         return config
     except Exception as e:
@@ -110,70 +170,36 @@ async def resolve_entities(config):
                     logger.warning(f"Warning: Target {target_channel.title} may not be a supergroup. Topics may not work.")
     except Exception as e:
         logger.error(f"Error resolving target channel: {e}")
-        # Ask user if they want to use their own user ID as target
-        me = await client.get_me()
-        logger.info(f"Your user ID is: {me.id}")
-        use_own_id = input("Do you want to use your own user ID as target? (y/n): ").lower() == 'y'
-        if use_own_id:
-            config['target_channel_id'] = me.id
-            known_entities[me.id] = me
-            logger.info(f"Using your user ID ({me.id}) as target")
-            # Can't use topics when forwarding to a user
-            if 'topic_id' in config:
-                logger.warning("Topics cannot be used when forwarding to a user. Removing topic_id.")
-                del config['topic_id']
-        else:
-            target_id = input("Please enter a valid channel ID or username: ")
-            try:
-                if target_id.startswith('@'):
-                    target_id = target_id[1:]
-                if target_id.isdigit():
-                    target_id = int(target_id)
-                target = await client.get_entity(target_id)
-                config['target_channel_id'] = target.id
-                known_entities[target.id] = target
-                logger.info(f"Successfully resolved new target: {target.title}")
-                
-                # Ask user if they want to use a global topic ID
-                use_topic = input("Do you want to set a global topic ID for all messages? (y/n): ").lower() == 'y'
-                if use_topic:
-                    topic_id = input("Please enter the global topic ID: ")
-                    if topic_id.isdigit():
-                        config['topic_id'] = int(topic_id)
-                        logger.info(f"Using global topic ID {topic_id} for messages")
-            except Exception as e:
-                logger.error(f"Error resolving new target: {e}")
-                exit(1)
+        logger.error(f"Could not resolve target channel ID from config: {config['target_channel_id']}")
+        logger.error("Please check your config.yaml file and ensure the target_channel_id is correct")
+        exit(1)
     
     # Resolve source entities
-    for source in config['sources']:
-        try:
-            if source['type'] == 'channel':
-                entity = await client.get_entity(source['id'])
-                known_entities[source['id']] = entity
-                logger.info(f"Resolved channel: {entity.title}")
-            elif source['type'] == 'public_group':
-                entity = await client.get_entity(source['username'])
-                known_entities[source['username']] = entity
-                logger.info(f"Resolved public group: {entity.title}")
-                # Check if user_ids is empty or not provided
-                if 'user_ids' not in source or not source['user_ids']:
-                    logger.info(f"No specific user IDs provided for {entity.title}, will forward messages from all users")
-            elif source['type'] == 'private_group':
-                # For private groups, we need the group ID
-                if 'id' in source:
+    if 'sources' in config:
+        for source in config['sources']:
+            try:
+                if source.get('type') == 'channel' and 'id' in source:
+                    try:
+                        entity = await client.get_entity(source['id'])
+                        known_entities[source['id']] = entity
+                        logger.info(f"Resolved channel: {entity.title}")
+                    except Exception as e:
+                        logger.warning(f"Could not resolve channel {source['id']}: {e}")
+                elif source.get('type') == 'public_group' and 'username' in source:
+                    try:
+                        entity = await client.get_entity(source['username'])
+                        known_entities[source['username']] = entity
+                        logger.info(f"Resolved public group: {entity.title}")
+                    except Exception as e:
+                        logger.warning(f"Could not resolve public group @{source['username']}: {e}")
+                elif source.get('type') == 'private_group' and 'id' in source:
                     # Store the ID for later use in message handler
-                    # We'll handle private groups differently in the message handler
                     known_entities[source['id']] = {'id': source['id'], 'type': 'private_group'}
                     logger.info(f"Stored private group ID: {source['id']}")
-                    
-                    # Check if user_ids is empty or not provided
-                    if 'user_ids' not in source or not source['user_ids']:
-                        logger.info(f"No specific user IDs provided for private group {source['id']}, will forward messages from all users")
-                else:
-                    logger.error("Private group configuration missing 'id' field")
-        except Exception as e:
-            logger.error(f"Error resolving {source['type']} {source.get('id', source.get('username', 'unknown'))}: {e}")
+            except Exception as e:
+                source_id = source.get('id', source.get('username', 'unknown'))
+                logger.warning(f"Error processing source {source_id}: {e}")
+                logger.warning("This source will be skipped")
 
 # Register event handlers for each source type
 async def register_event_handlers():
@@ -532,38 +558,56 @@ async def schedule_cleanup():
 async def main():
     """Main function to run the client"""
     global config
+    
+    # Load configuration
     config = load_config()
     if not config:
+        logger.error("Failed to load configuration. Exiting.")
         return
     
     # Connect to Telegram
-    await client.start()
-    
-    # Resolve all entities at startup
-    await resolve_entities(config)
-    
-    # Register event handlers
-    await register_event_handlers()
-    
-    # Log successful connection
-    me = await client.get_me()
-    logger.info(f"Connected as {me.first_name} (ID: {me.id})")
-    
-    # Print all configured sources for debugging
-    logger.info("Configured sources:")
-    for source in config['sources']:
-        if source['type'] == 'channel':
-            logger.info(f"  - Channel: {source['id']}")
-        elif source['type'] == 'public_group':
-            logger.info(f"  - Public group: {source['username']}")
-        elif source['type'] == 'private_group':
-            logger.info(f"  - Private group: {source['id']}")
-    
-    # Start the cleanup scheduler
-    asyncio.create_task(schedule_cleanup())
-    
-    # Keep the client running
-    await client.run_until_disconnected()
+    try:
+        await client.start()
+        
+        # Log successful connection
+        me = await client.get_me()
+        logger.info(f"Connected as {me.first_name} (ID: {me.id})")
+        
+        # Resolve all entities at startup
+        await resolve_entities(config)
+        
+        # Register event handlers
+        await register_event_handlers()
+        
+        # Print all configured sources for debugging
+        if 'sources' in config and config.get('sources'):
+            logger.info("Configured sources:")
+            for source in config['sources']:
+                if source.get('type') == 'channel' and 'id' in source:
+                    logger.info(f"  - Channel: {source['id']}")
+                elif source.get('type') == 'public_group' and 'username' in source:
+                    logger.info(f"  - Public group: {source['username']}")
+                elif source.get('type') == 'private_group' and 'id' in source:
+                    logger.info(f"  - Private group: {source['id']}")
+                else:
+                    source_id = source.get('id', source.get('username', 'unknown'))
+                    logger.info(f"  - Unknown source type: {source.get('type', 'unknown')} ({source_id})")
+        else:
+            logger.warning("No sources configured. The bot is running but won't monitor any messages.")
+        
+        # Start the cleanup scheduler
+        asyncio.create_task(schedule_cleanup())
+        
+        # Keep the client running
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"Error in main function: {e}")
+        sys.exit(1)
+    finally:
+        # Make sure we disconnect cleanly
+        if client.is_connected():
+            await client.disconnect()
+            logger.info("Disconnected from Telegram")
 
 if __name__ == "__main__":
     asyncio.run(main()) 
