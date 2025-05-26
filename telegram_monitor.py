@@ -410,82 +410,38 @@ async def register_event_handlers():
 async def forward_message(event):
     """Send a copy of the message to the target channel with source information"""
     try:
-        # Get message details for debugging
         chat = await event.get_chat()
         sender = await event.get_sender()
         message_text = event.message.text if event.message.text else ""
-        
-        # Get sender name safely
+
         sender_name = None
         if hasattr(sender, 'username') and sender.username:
             sender_name = f"@{sender.username}"
         elif hasattr(sender, 'first_name'):
             sender_name = sender.first_name
-        elif hasattr(sender, 'title'):  # For channels
+        elif hasattr(sender, 'title'):
             sender_name = sender.title
         else:
             sender_name = "Unknown"
-        
+
         logger.info(f"Attempting to send message from {chat.title} by {sender_name}")
         logger.info(f"Message content: {message_text[:100]}{'...' if len(message_text) > 100 else ''}")
-        
-        # Check if this is a reply to another message
-        replied_message = None
-        if event.message.reply_to:
-            try:
-                replied_message = await event.message.get_reply_message()
-                logger.info(f"Message is a reply to: {replied_message.text[:100] if replied_message.text else 'media message'}")
-            except Exception as e:
-                logger.error(f"Error getting replied message: {e}")
-        
+
         # Download media if present
         media_path = None
         if event.message.media:
             logger.info(f"Message contains media, downloading...")
             try:
-                # Create a directory for media if it doesn't exist
                 os.makedirs("downloaded_media", exist_ok=True)
-                
-                # Download the media
                 media_path = await event.message.download_media("downloaded_media")
                 logger.info(f"Media downloaded to: {media_path}")
             except Exception as e:
                 logger.error(f"Error downloading media: {e}")
-        
-        # Prepare the formatted message
-        formatted_message = ""
-        
-        # Add reply information first if present
-        if replied_message:
-            replied_sender = await replied_message.get_sender()
-            replied_sender_name = None
-            if hasattr(replied_sender, 'username') and replied_sender.username:
-                replied_sender_name = f"@{replied_sender.username}"
-            elif hasattr(replied_sender, 'first_name'):
-                replied_sender_name = replied_sender.first_name
-            elif hasattr(replied_sender, 'title'):
-                replied_sender_name = replied_sender.title
-            else:
-                replied_sender_name = "Unknown"
-            
-            replied_text = replied_message.text if replied_message.text else "media message"
-            formatted_message += f"Replying to {replied_sender_name}: {replied_text[:100]}{'...' if len(replied_text) > 100 else ''}\n"
-            formatted_message += "--------------------------------\n"
-        
-        # Add the message text if present
-        if message_text:
-            formatted_message += f"{message_text}\n"
-        
-        # Add separator line
-        formatted_message += "--------------------------------\n"
-        
-        # Add source information
-        formatted_message += f"From: {chat.title} - {sender_name}"
-        
+
         # Find the source config for this message
         source_config = None
         topic_id = None
-        
+
         for source in config['sources']:
             if source['type'] == 'channel' and str(chat.id).replace('-100', '') == str(source['id']).replace('-100', ''):
                 source_config = source
@@ -496,18 +452,73 @@ async def forward_message(event):
             elif source['type'] == 'public_group' and hasattr(chat, 'username') and chat.username == source['username']:
                 source_config = source
                 break
-        
-        # Get topic ID for this source if available
+
         if source_config and 'target_topic' in source_config:
             topic_id = source_config['target_topic']
             logger.info(f"Using source-specific topic ID: {topic_id}")
-        elif 'topic_id' in config:  # Fall back to global topic ID
+        elif 'topic_id' in config:
             topic_id = config['topic_id']
             logger.info(f"Using global topic ID: {topic_id}")
         else:
             logger.info("No topic ID found, sending to main chat")
-        
-        # Send the message with media if available
+
+        # If this message is a reply, send the replied-to message first and capture its message ID
+        reply_to_msg_id = None
+        if event.message.reply_to:
+            try:
+                replied_message = await event.message.get_reply_message()
+                if replied_message:
+                    replied_sender = await replied_message.get_sender()
+                    replied_sender_name = None
+                    if hasattr(replied_sender, 'username') and replied_sender.username:
+                        replied_sender_name = f"@{replied_sender.username}"
+                    elif hasattr(replied_sender, 'first_name'):
+                        replied_sender_name = replied_sender.first_name
+                    elif hasattr(replied_sender, 'title'):
+                        replied_sender_name = replied_sender.title
+                    else:
+                        replied_sender_name = "Unknown"
+                    replied_text = replied_message.text if replied_message.text else ""
+                    replied_formatted = f"Replied from {replied_sender_name}:\n{replied_text}"
+
+                    # Download media if present in replied message
+                    replied_media_path = None
+                    if replied_message.media:
+                        try:
+                            os.makedirs("downloaded_media", exist_ok=True)
+                            replied_media_path = await replied_message.download_media("downloaded_media")
+                        except Exception as e:
+                            logger.error(f"Error downloading replied media: {e}")
+
+                    # Send the replied message first, with or without media
+                    if replied_media_path:
+                        sent = await client.send_file(
+                            config['target_channel_id'],
+                            replied_media_path,
+                            caption=replied_formatted if replied_text else f"Replied from {replied_sender_name}",
+                            reply_to=topic_id
+                        )
+                    else:
+                        # If the replied message has no text and no media, send a placeholder
+                        if not replied_text:
+                            replied_formatted = f"Replied from {replied_sender_name}: [no text or media]"
+                        sent = await client.send_message(
+                            config['target_channel_id'],
+                            replied_formatted,
+                            reply_to=topic_id
+                        )
+                    reply_to_msg_id = sent.id
+            except Exception as e:
+                logger.error(f"Error forwarding replied message: {e}")
+
+        # Prepare the formatted message for the main message
+        formatted_message = ""
+        if message_text:
+            formatted_message += f"{message_text}\n"
+        formatted_message += "--------------------------------\n"
+        formatted_message += f"From: {chat.title} - {sender_name}"
+
+        # Send the main message, replying to the forwarded replied message if applicable
         try:
             if media_path:
                 logger.info(f"Sending message with downloaded media: {media_path}")
@@ -515,15 +526,14 @@ async def forward_message(event):
                     config['target_channel_id'],
                     media_path,
                     caption=formatted_message,
-                    reply_to=topic_id
+                    reply_to=reply_to_msg_id if reply_to_msg_id else topic_id
                 )
                 logger.info("Message sent with media successfully")
             else:
-                # Send just the text if no media
                 await client.send_message(
                     config['target_channel_id'],
                     formatted_message,
-                    reply_to=topic_id
+                    reply_to=reply_to_msg_id if reply_to_msg_id else topic_id
                 )
                 logger.info("Message sent as text successfully")
         except Exception as e:
@@ -610,4 +620,4 @@ async def main():
             logger.info("Disconnected from Telegram")
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    asyncio.run(main())
