@@ -30,6 +30,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Proxy configuration for Telethon (SOCKS5 at 127.0.0.1:1111)
+PROXY = ('socks5', '127.0.0.1', 1111)
+
 # Create example config file
 def create_example_config():
     example_config = """# Target supergroup where messages will be forwarded to
@@ -133,7 +136,7 @@ if not api_id or not api_hash:
     logger.error("API ID or API Hash not found in environment variables")
     exit(1)
 
-client = TelegramClient('user_session', api_id, api_hash)
+client = TelegramClient('user_session', api_id, api_hash, proxy=PROXY)
 
 # Store known entities to avoid repeated resolution
 known_entities = {}
